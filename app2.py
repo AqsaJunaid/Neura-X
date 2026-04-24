@@ -17,11 +17,17 @@ import hashlib
 from dotenv import load_dotenv
 from datetime import datetime, timezone   # ← add this import at the top of file if missing
 
-load_dotenv()  # <-- add this near the top
-
-
+load_dotenv() 
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program
 # Files\Tesseract-OCR\tesseract.exe"
+
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+clinical_bert_model = "medicalai/ClinicalBERT"
+clinical_bert_tokenizer = os.getenv("HF_TOKEN")
+
+
 
 
 # ====================== SUPABASE POSTGRES (ZERO MAINTENANCE) ============
