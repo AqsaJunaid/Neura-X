@@ -1,36 +1,28 @@
 from contextlib import contextmanager
 from psycopg2.extras import RealDictCursor
 import psycopg2
-import pytesseract
 import os
-import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from werkzeug.utils import secure_filename
 from groq import Groq
 from dotenv import load_dotenv
-from PIL import Image
-import fitz  # PyMuPDF
+from PIL import Image  # still useful for OCR API preprocessing (NOT local OCR)
+import fitz  # PyMuPDF (PDF text extraction only)
 import io
 import numpy as np
 import hashlib
-from dotenv import load_dotenv
-from datetime import datetime, timezone   # ← add this import at the top of file if missing
+import requests  # for external OCR API + Hugging Face API calls
 
-load_dotenv() 
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program
-# Files\Tesseract-OCR\tesseract.exe"
+# Hugging Face (API-based inference only, no local model loading)
+from huggingface_hub import InferenceClient
 
-if os.name == "nt":
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+load_dotenv()  
 
-clinical_bert_model = "medicalai/ClinicalBERT"
-clinical_bert_tokenizer = os.getenv("HF_TOKEN")
+CLINICAL_BERT_MODEL_ID = "d4data/biomedical-ner-all"
 
 
-
-
-# ====================== SUPABASE POSTGRES (ZERO MAINTENANCE) ============
+# ====================== SUPABASE POSTGRES ============
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -40,9 +32,11 @@ if not DATABASE_URL:
 
 @contextmanager
 def get_db():
-    """Use like: with get_db() as conn: ... """
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
+        # Quick check to ensure the connection is active
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
         yield conn
     finally:
         conn.close()
@@ -61,18 +55,8 @@ def query_all(query, params=()):
         cur = conn.cursor()
         cur.execute(query, params)
         return cur.fetchall()
-# =================================================================================
 
 
-# Clinical BERT will be loaded lazily
-
-#write clinical bert code
-
-# Load environment variables (optional - API key is now hardcoded)
-try:
-    load_dotenv()
-except:
-    pass  # Continue even if .env file has issues
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -80,8 +64,7 @@ app.config['PROFILE_FOLDER'] = 'static/profiles'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'pdf'}
 # For session management
-app.config['SECRET_KEY'] = 'hms-secret-key-change-in-production'
-# Set to True in production with HTTPS
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY") or "dev-secret-key"# Set to True in production with HTTPS
 app.config['SESSION_COOKIE_SECURE'] = False
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
@@ -167,52 +150,55 @@ def get_groq_client():
     return groq_client
 
 
-# OCR reader - will try multiple OCR methods
-ocr_reader = None
-ocr_method = None
+# OCR reader 
+def extract_text_cloud_ocr(file_path):
+    """
+    Cloud OCR using OCR.Space API (Production-safe version)
+    Supports images and scanned PDFs
+    """
 
+    api_key = os.getenv("OCR_SPACE_API_KEY")
 
-def get_ocr_reader():
-    """Lazy initialization of OCR reader - tries multiple methods"""
-    global ocr_reader, ocr_method
+    if not api_key:
+        raise Exception("OCR_SPACE_API_KEY not set in environment variables")
 
-    if ocr_reader is not None:
-        return ocr_reader, ocr_method
-
-    # Try PaddleOCR first
     try:
-        from paddleocr import PaddleOCR
-        print("Attempting to initialize PaddleOCR...")
-        # Use minimal parameters that are supported
-        ocr_reader = PaddleOCR(use_textline_orientation=True, lang='en')
-        ocr_method = 'paddleocr'
-        print("PaddleOCR initialized successfully.")
-        return ocr_reader, ocr_method
-    except Exception as e:
-        print(f"PaddleOCR initialization failed: {str(e)}")
+        with open(file_path, 'rb') as f:
+            response = requests.post(
+                "https://api.ocr.space/parse/image",
+                files={"file": f},   # ✅ FIXED HERE
+                data={
+                    "apikey": api_key,
+                    "language": "eng",
+                    "isOverlayRequired": False,
+                    "OCREngine": 2
+                },
+                timeout=60
+            )
 
-    # Fallback: Try pytesseract if available
-    try:
-        import pytesseract
-        # Test if tesseract is available
-        pytesseract.get_tesseract_version()
-        ocr_reader = pytesseract
-        ocr_method = 'pytesseract'
-        print("Using pytesseract as OCR backend.")
-        return ocr_reader, ocr_method
-    except Exception as e:
-        # pytesseract might be installed but Tesseract engine not found
-        if "tesseract" in str(e).lower() or "not found" in str(e).lower():
-            print(
-    f"pytesseract requires Tesseract OCR engine to be installed separately.")
-        else:
-            print(f"pytesseract not available: {str(e)}")
+        # ---- SAFE JSON HANDLING ----
+        try:
+            result = response.json()
+        except Exception:
+            raise Exception(f"OCR API returned invalid response: {response.text[:200]}")
 
-    # Final fallback: Return None - will use PyMuPDF text extraction only
-    print("Warning: No OCR backend available. Only text-based PDFs will work.")
-    print("For image OCR, install Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki")
-    ocr_method = 'none'
-    return None, ocr_method
+        # ---- ERROR CHECK ----
+        if result.get("IsErroredOnProcessing"):
+            error_msg = result.get("ErrorMessage") or result.get("ErrorDetails") or "Unknown OCR error"
+            raise Exception(f"OCR failed: {error_msg}")
+
+        parsed_results = result.get("ParsedResults")
+
+        if not parsed_results:
+            return ""
+
+        text = parsed_results[0].get("ParsedText", "")
+
+        return text.strip()
+
+    except Exception as e:
+        raise Exception(f"Cloud OCR failed: {str(e)}")
+
 
 
 def init_db():
@@ -816,49 +802,68 @@ SPECIALIST_TYPES = {
     'gynecologist': 'Gynecologist',
 }
 
+
+
+# Replace your old global model/tokenizer variables with this
+hf_client = None
+
 def get_clinical_bert():
-    """Lazy initialization of Clinical BERT model"""
-    global clinical_bert_model, clinical_bert_tokenizer
-    if clinical_bert_model is None:
+    """
+    Initializes the Hugging Face Inference Client.
+    In the API version, we don't 'load' the model into RAM, 
+    we just ensure the client is ready to make requests.
+    """
+    global hf_client
+    if hf_client is None:
         try:
-            from transformers import AutoTokenizer, AutoModel
-            print("Loading Clinical BERT model (emilyalsentzer/Bio_ClinicalBERT)...")
-            clinical_bert_tokenizer = AutoTokenizer.from_pretrained(
-                "emilyalsentzer/Bio_ClinicalBERT")
-            clinical_bert_model = AutoModel.from_pretrained(
-                "emilyalsentzer/Bio_ClinicalBERT")
-            print("Clinical BERT loaded successfully.")
-        except ImportError:
-            print(
-                "Clinical BERT not available. Install with: pip install transformers torch")
-            clinical_bert_model = None
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                print("HF_TOKEN missing in environment variables.")
+                return None
+            
+            # Initialize the client (very lightweight)
+            hf_client = InferenceClient(token=hf_token)
+            print("Hugging Face Inference Client initialized successfully.")
         except Exception as e:
-            print(f"Clinical BERT loading failed: {str(e)}")
-            clinical_bert_model = None
-    return clinical_bert_model, clinical_bert_tokenizer
+            print(f"Hugging Face Client initialization failed: {str(e)}")
+            hf_client = None
+            
+    return hf_client
 
 
 def analyze_with_clinical_bert(text):
-    """Use Clinical BERT to extract medical entities and insights"""
-    model, tokenizer = get_clinical_bert()
-    if model is None or tokenizer is None:
+    """Actually extract medical entities using the HF API"""
+    client = get_clinical_bert()
+    if client is None:
         return None
 
     try:
-        import torch
-        # Tokenize and encode the text
-        inputs = tokenizer(text[:512], return_tensors="pt",
-                           truncation=True, max_length=512)
+        # We switch to a model fine-tuned for NER (Named Entity Recognition)
+        # This model actually picks out "Aspirin" or "Diabetes"
+        model_id = "d4data/biomedical-ner-all"
+        
+        # We use the token_classification task (NER)
+        entities = client.token_classification(
+            text[:512],
+            model=model_id
+        )
 
-        # Get embeddings
-        with torch.no_grad():
-            outputs = model(**inputs)
+        if not entities:
+            return "No specific medical entities identified."
 
-        # Extract key medical insights
-        # In production, you'd use NER models to extract medical entities
-        return "Clinical BERT Analysis: Medical terminology and clinical concepts successfully processed. Key medical entities identified in the report text."
+        # Extract unique labels and words (e.g., "Medication: Aspirin")
+        found_entities = []
+        for e in entities:
+            # Only keep high-confidence entities
+            if e['score'] > 0.8:
+                found_entities.append(f"{e['entity_group']}: {e['word']}")
+        
+        # Remove duplicates and join
+        unique_entities = list(set(found_entities))
+        return "Clinical BERT identified the following entities: " + ", ".join(unique_entities)
+
     except Exception as e:
-        print(f"Clinical BERT analysis error: {str(e)}")
+        print(f"Clinical BERT API error: {str(e)}")
         return None
 
 
@@ -869,115 +874,54 @@ def allowed_file(filename):
 
 
 def extract_text_from_image(image_path):
-    """Extract text from an image using available OCR method"""
-    reader, method = get_ocr_reader()
-
-    if method == 'paddleocr':
-        try:
-            # PaddleOCR method
-            results = reader.ocr(image_path, cls=True)
-            text_lines = []
-            if results and results[0]:
-                for line in results[0]:
-                    if line and len(line) >= 2:
-                        text_lines.append(line[1][0])  # line[1][0] is the text
-            text = '\n'.join(text_lines)
-            if not text.strip():
-                raise Exception("No text extracted from image")
-            return text
-        except Exception as e:
-            # If PaddleOCR fails at runtime, try to fallback
-            print(f"PaddleOCR runtime error: {str(e)}. Attempting fallback...")
-            # Try pytesseract as fallback
-            try:
-                import pytesseract
-                image = Image.open(image_path)
-                text = pytesseract.image_to_string(image)
-                if text.strip():
-                    return text
-            except:
-                pass
-            raise Exception(f"OCR extraction failed: {str(e)}")
-
-    elif method == 'pytesseract':
-        try:
-            # pytesseract method
-            image = Image.open(image_path)
-            text = reader.image_to_string(image)
-            return text
-        except Exception as e:
-            raise Exception(f"OCR extraction failed: {str(e)}")
-
-    else:
-        # If no OCR available, provide helpful error message
-        raise Exception("No OCR backend available for image processing. The uploaded file appears to be an image without extractable text. Please: 1) Install Tesseract OCR engine (https://github.com/UB-Mannheim/tesseract/wiki) and ensure pytesseract works, OR 2) Upload a text-based PDF which can be extracted without OCR. For now, you can upload PDFs with text layers that don't require OCR.")
-
-
-def extract_text_from_pdf(pdf_path):
-    """Extract text from a PDF using PyMuPDF (Python-only)"""
+    """
+    Cloud-based OCR extraction using OCR.Space API
+    Fully production-safe (Render compatible)
+    """
     try:
-        # Open PDF with PyMuPDF
+        return extract_text_cloud_ocr(image_path)
+    except Exception as e:
+        raise Exception(f"Cloud OCR failed: {str(e)}")
+    
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF using PyMuPDF + Cloud OCR fallback"""
+    try:
         pdf_document = fitz.open(pdf_path)
-        extracted_texts = []
 
-        # Try to extract text directly first (if PDF has text layer)
+        # Step 1: Try direct text extraction (FAST PATH)
         text_content = ""
         for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
             text_content += page.get_text()
 
-        # If direct text extraction worked, return it
         if text_content.strip():
             pdf_document.close()
             return text_content
 
-        # If no text layer, convert pages to images and use OCR
+        # Step 2: If scanned PDF → use Cloud OCR per page
         extracted_texts = []
+
         for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
-            # Convert page to image (pixmap)
-            pix = page.get_pixmap(
-    matrix=fitz.Matrix(
-        2, 2))  # 2x zoom for better OCR
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img_data = pix.tobytes("png")
 
-            # Convert to temporary image file for PaddleOCR
-            # PaddleOCR works best with file paths
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_file.write(img_data)
                 tmp_path = tmp_file.name
-                img = Image.open(io.BytesIO(img_data))
-                img.save(tmp_path)
 
-            # Get OCR reader (lazy initialization) and use on the image
-            reader, method = get_ocr_reader()
-
-            if method == 'paddleocr':
-                results = reader.ocr(tmp_path, cls=True)
-                text_lines = []
-                if results and results[0]:
-                    for line in results[0]:
-                        if line and len(line) >= 2:
-                            text_lines.append(line[1][0])
-                page_text = '\n'.join(text_lines)
-            elif method == 'pytesseract':
-                img = Image.open(tmp_path)
-                page_text = reader.image_to_string(img)
-            else:
-                page_text = "[OCR not available - image-based PDF requires OCR backend]"
-
-            extracted_texts.append(page_text)
-
-            # Clean up temporary file
             try:
+                page_text = extract_text_cloud_ocr(tmp_path)
+                extracted_texts.append(page_text)
+            finally:
                 os.unlink(tmp_path)
-            except:
-                pass
 
         pdf_document.close()
 
-        # Concatenate all pages
-        return '\n\n--- Page Break ---\n\n'.join(extracted_texts)
+        return "\n\n--- Page Break ---\n\n".join(extracted_texts)
+
     except Exception as e:
         raise Exception(f"PDF extraction failed: {str(e)}")
 
@@ -987,21 +931,24 @@ def get_or_create_patient(name):
     with get_db() as conn:
         cur = conn.cursor()
 
-        # Check if patient exists
         cur.execute('SELECT id FROM patients WHERE name = %s', (name,))
         patient = cur.fetchone()
 
         if patient:
-            patient_id = patient['id']   # RealDictCursor returns dict
-        else:
-            # Create new patient
-            created_at = datetime.now().isoformat()
-            cur.execute(
-                'INSERT INTO patients (name, created_at) VALUES (%s, %s) RETURNING id',
-                (name, created_at)
-            )
-            patient_id = cur.fetchone()['id']
+            return patient['id']
 
+        created_at = datetime.now(timezone.utc)
+
+        cur.execute(
+            '''
+            INSERT INTO patients (name, patient_id, created_at)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            ''',
+            (name, f"PAT-{int(datetime.now().timestamp())}", created_at)
+        )
+
+        patient_id = cur.fetchone()['id']
         conn.commit()
         return patient_id
 
@@ -1517,33 +1464,29 @@ def create_or_update_doctor(name, specialist_type, profile_picture=None):
 
 
 def chatbot_response(message, specialist_type, doctor_id=None):
-    """Generate chatbot response using Clinical BERT with specialist context"""
+    """Generate chatbot response using Clinical BERT API with specialist context"""
     try:
-        # Use Clinical BERT to analyze the doctor's query
+        # Calls the new lightweight API function
         clinical_bert_analysis = analyze_with_clinical_bert(message)
 
-        # Get specialist context
         specialist_prompt = get_specialist_prompt(specialist_type)
         specialist_name = SPECIALIST_TYPES.get(specialist_type, 'medical')
 
-        # Build context for response generation
+        # Build context - Clinical BERT now provides structured entities here
         context_text = f"""Specialist Context: {specialist_prompt}
 Specialist Type: {specialist_name}
 
-Clinical BERT Analysis of Query: {clinical_bert_analysis if clinical_bert_analysis else 'No specific medical entities detected.'}
+Clinical BERT Identified Entities: {clinical_bert_analysis if clinical_bert_analysis else 'Standard processing - no specific entities detected.'}
 
 You are an AI assistant helping a {specialist_name} professional.
-Answer questions clearly, professionally, and with medical accuracy based on the Clinical BERT analysis.
-If asked about something outside your specialty, acknowledge it and suggest consulting the appropriate specialist."""
+Answer questions clearly, professionally, and with medical accuracy based on the context above."""
 
-        # Use Groq LLM with Clinical BERT context for generating the response
-        # (Clinical BERT provides medical entity extraction, Groq provides natural language generation)
         client = get_groq_client()
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": context_text},
-                {"role": "user", "content": f"Doctor's Question: {message}\n\nPlease provide a professional medical response based on the Clinical BERT analysis above."}
+                {"role": "user", "content": f"Doctor's Question: {message}"}
             ],
             temperature=0.7,
             max_tokens=1000
@@ -1551,23 +1494,21 @@ If asked about something outside your specialty, acknowledge it and suggest cons
 
         bot_response = response.choices[0].message.content
 
-        # Add note about Clinical BERT usage
+        # Append structured note
         if clinical_bert_analysis:
-            bot_response += f"\n\n[Note: This response was enhanced using Clinical BERT medical entity analysis.]"
+            bot_response += f"\n\n[Note: Clinical BERT identified: {clinical_bert_analysis.replace('Clinical BERT identified the following entities: ', '')}]"
 
-        # Save chat message to database
-        # Save chat message to database
+        # Database saving logic (remains the same)
         if doctor_id:
             try:
                 with get_db() as conn:
                     cur = conn.cursor()
                     created_at = datetime.now().isoformat()
                     cur.execute('''
-                        INSERT INTO chat_messages
+                        INSERT INTO chat_messages 
                         (doctor_id, specialist_type, message, response, created_at)
                         VALUES (%s, %s, %s, %s, %s)
                     ''', (doctor_id, specialist_type, message, bot_response, created_at))
-                    # commit is automatic on success
             except Exception as e:
                 print(f"Error saving chat message: {str(e)}")
 
@@ -1576,16 +1517,13 @@ If asked about something outside your specialty, acknowledge it and suggest cons
         return f"I apologize, but I encountered an error: {str(e)}"
 
 
-def save_report(
-    patient_id,
-    filename,
-    extracted_text,
-    llm_analysis,
-    specialist_type='general',
-    doctor_id=None,
-     clinical_bert_analysis=None):
+def save_report(patient_id, filename, extracted_text, llm_analysis, specialist_type='general', doctor_id=None, clinical_bert_analysis=None):
     if not specialist_type or specialist_type not in SPECIALIST_TYPES:
         specialist_type = 'general'
+
+    # If the analysis wasn't provided by the calling function, trigger it now
+    if not clinical_bert_analysis and extracted_text:
+        clinical_bert_analysis = analyze_with_clinical_bert(extracted_text)
 
     created_at = datetime.now(timezone.utc)
     report_id = None
@@ -1593,49 +1531,32 @@ def save_report(
     try:
         with get_db() as conn:
             cur = conn.cursor()
+            # The structure of your INSERT stays identical
             cur.execute('''
-                INSERT INTO reports
-                (doctor_id, patient_id, specialist_type, original_filename,
+                INSERT INTO reports 
+                (doctor_id, patient_id, specialist_type, original_filename, 
                  extracted_text, llm_analysis, clinical_bert_analysis, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
-            ''', (doctor_id, patient_id, specialist_type, filename,
+            ''', (doctor_id, patient_id, specialist_type, filename, 
                   extracted_text, llm_analysis, clinical_bert_analysis, created_at))
             report_id = cur.fetchone()['id']
             conn.commit()
             print(f"[save_report] Report saved successfully with ID: {report_id}")
 
     except psycopg2.errors.UndefinedColumn:
-        print("Missing column - running migration")
+        # Migration logic remains the same
         migrate_database()
-        # Retry
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute('''
-                INSERT INTO reports
-                (doctor_id, patient_id, specialist_type, original_filename,
-                 extracted_text, llm_analysis, clinical_bert_analysis, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            ''', (doctor_id, patient_id, specialist_type, filename,
-                  extracted_text, llm_analysis, clinical_bert_analysis, created_at))
-            report_id = cur.fetchone()['id']
-            conn.commit()
-            print(f"[save_report] Report saved after migration with ID: {report_id}")
+        return save_report(patient_id, filename, extracted_text, llm_analysis, specialist_type, doctor_id, clinical_bert_analysis)
 
     except Exception as e:
         print(f"Error saving report: {str(e)}")
         return None
 
-    # Anomaly detection
+    # Anomaly detection logic remains the same
     if report_id and extracted_text:
         try:
-            anomalies = detect_lab_anomalies(
-    extracted_text, report_id=report_id, patient_id=patient_id)
-            if anomalies:
-                print(
-    f"Detected {
-        len(anomalies)} anomalies in report {report_id}")
+            detect_lab_anomalies(extracted_text, report_id=report_id, patient_id=patient_id)
         except Exception as e:
             print(f"Error running anomaly detection: {str(e)}")
 
@@ -1906,112 +1827,85 @@ def specialist_page(specialist_type):
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Handle file upload, OCR, and AI analysis"""
-    # Allow both doctors and patients to upload reports
-    if 'user_role' not in session or session['user_role'] not in [
-        'doctor', 'patient']:
+    """Handle file upload, text extraction, and AI analysis"""
+
+    if 'user_role' not in session or session['user_role'] not in ['doctor', 'patient']:
         return jsonify({'error': 'Unauthorized'}), 401
+
     try:
-        # Validate file and patient name
+        # 1. Validation
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
 
         file = request.files['file']
         patient_name = request.form.get('patient_name', '').strip()
 
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-
-        if not patient_name:
-            return jsonify({'error': 'Patient name is required'}), 400
+        if file.filename == '' or not patient_name:
+            return jsonify({'error': 'File and Patient Name are required'}), 400
 
         if not allowed_file(file.filename):
-            return jsonify(
-                {'error': 'Invalid file type. Allowed types: PNG, JPG, JPEG, PDF'}), 400
+            return jsonify({'error': 'Invalid file type'}), 400
 
-        # Save uploaded file
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
-        # Extract text using OCR
+        # 2. TEXT EXTRACTION (ONLY PDF SUPPORTED FOR NOW)
         file_ext = filename.rsplit('.', 1)[1].lower()
+
         if file_ext == 'pdf':
             extracted_text = extract_text_from_pdf(filepath)
         else:
-            extracted_text = extract_text_from_image(filepath)
+            return jsonify({
+                'error': 'Image OCR removed. Please upload PDF OR integrate OCR API.'
+            }), 400
 
-        if not extracted_text or not extracted_text.strip():
-            # Check if it was an image file that failed OCR
-            if file_ext != 'pdf':
-                return jsonify({'error': 'No text could be extracted from the image. This may be because OCR is not available. Please ensure: 1) The image is clear and readable, 2) OCR backend (PaddleOCR or Tesseract) is properly installed. Alternatively, convert the image to a text-based PDF.'}), 400
-            else:
-                return jsonify(
-                    {'error': 'No text could be extracted from the PDF. If this is an image-based PDF, OCR may not be available. Please ensure OCR backend is installed, or try a PDF with extractable text.'}), 400
+        if not extracted_text.strip():
+            return jsonify({'error': 'No text extracted'}), 400
 
-        # Get specialist type and doctor ID from form
-        specialist_type = request.form.get(
-    'specialist_type', 'general').strip()
-        if not specialist_type or specialist_type not in SPECIALIST_TYPES:
+        # 3. AI ANALYSIS
+        specialist_type = request.form.get('specialist_type', 'general')
+        if specialist_type not in SPECIALIST_TYPES:
             specialist_type = 'general'
 
-        doctor_id = request.form.get('doctor_id', None)
-        if doctor_id:
-            try:
-                doctor_id = int(doctor_id) if doctor_id else None
-            except:
-                doctor_id = None
-        else:
+        doctor_id = request.form.get('doctor_id')
+        try:
+            doctor_id = int(doctor_id) if doctor_id else None
+        except:
             doctor_id = None
 
-        # Analyze with Groq API (specialist-specific)
-        llm_analysis_result = analyze_with_groq(
-            extracted_text, specialist_type)
+        llm_result = analyze_with_groq(extracted_text, specialist_type)
 
-        # Handle both old format (string) and new format (dict)
-        if isinstance(llm_analysis_result, dict):
-            llm_analysis_raw = llm_analysis_result.get('raw', '')
-            llm_analysis_formatted = llm_analysis_result.get('formatted', '')
+        if isinstance(llm_result, dict):
+            llm_analysis = llm_result.get('formatted', '')
         else:
-            llm_analysis_raw = llm_analysis_result
-            llm_analysis_formatted = format_analysis_response(
-                llm_analysis_result)
+            llm_analysis = format_analysis_response(llm_result)
 
-        # Clinical BERT analysis
+        # Hugging Face NER (API)
         clinical_bert_analysis = analyze_with_clinical_bert(extracted_text)
 
-        # Get or create patient
+        # 4. DB SAVE
         patient_id = get_or_create_patient(patient_name)
 
-        # Save to database (save formatted HTML - it will render properly in
-        # templates)
         save_report(
-    patient_id,
-    filename,
-    extracted_text,
-    llm_analysis_formatted,
-    specialist_type,
-    doctor_id,
-     clinical_bert_analysis)
+            patient_id,
+            filename,
+            extracted_text,
+            llm_analysis,
+            specialist_type,
+            doctor_id,
+            clinical_bert_analysis
+        )
 
-        # Return results - ensure HTML is properly formatted
-        # Use jsonify which handles JSON correctly, HTML in strings should not
-        # be escaped
-        response_data = {
+        return jsonify({
             'success': True,
             'extracted_text': extracted_text,
-            'llm_analysis': llm_analysis_formatted,  # Return formatted HTML string
-            'llm_analysis_raw': llm_analysis_raw,  # Also include raw for reference
+            'llm_analysis': llm_analysis,
             'clinical_bert_analysis': clinical_bert_analysis
-        }
+        })
 
-        # Use jsonify - it properly handles strings with HTML without escaping
-        return jsonify(response_data)
-
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 500
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/profile', methods=['POST'])
@@ -2127,7 +2021,7 @@ def get_patient_chatbot_context_questions():
 
 @app.route('/api/patient/chatbot', methods=['POST'])
 def patient_chatbot():
-    """Handle patient chatbot messages with Clinical BERT - Continuous Q&A flow"""
+    """Handle patient chatbot messages with Clinical BERT API - Continuous Q&A flow"""
     if 'user_role' not in session or session['user_role'] != 'patient':
         return jsonify({'error': 'Unauthorized'}), 401
     
@@ -2135,60 +2029,49 @@ def patient_chatbot():
         data = request.json
         message = data.get('message', '').strip()
         patient_id = data.get('patient_id') or session.get('user_db_id')
-        conversation_history = data.get('conversation_history', [])  # Array of {role, content}
+        conversation_history = data.get('conversation_history', [])
         
         if not message:
             return jsonify({'error': 'Message is required'}), 400
         
-        # Get patient's medical reports and info for context
+        # --- 1. Fetch Patient Context from Database ---
         with get_db() as conn:
             cur = conn.cursor()
-            
-            # Patient information
             cur.execute(
                 'SELECT name, allergies, medications, medical_history FROM patients WHERE id = %s',
                 (patient_id,)
             )
             patient_data = cur.fetchone()
-            patient_info = {}
-            if patient_data:
-                patient_info = {
-                    'name': patient_data['name'],
-                    'allergies': patient_data['allergies'],
-                    'medications': patient_data['medications'],
-                    'medical_history': patient_data['medical_history']
-                }
+            patient_info = patient_data if patient_data else {}
             
-            # Recent reports
             cur.execute('''
-                SELECT extracted_text, llm_analysis, clinical_bert_analysis, specialist_type 
+                SELECT clinical_bert_analysis 
                 FROM reports 
                 WHERE patient_id = %s
                 ORDER BY created_at DESC LIMIT 3
             ''', (patient_id,))
             reports = cur.fetchall()
         
-        # Use Clinical BERT to analyze the patient's query
+        # --- 2. Clinical BERT API Analysis ---
+        # This replaces the local model call with the lightweight API call
         clinical_bert_analysis = analyze_with_clinical_bert(message)
         
-        # Build conversation context
-        context_text = f"""Patient Information:
-- Name: {patient_info.get('name', 'N/A')}
-- Allergies: {patient_info.get('allergies', 'None reported')}
-- Current Medications: {patient_info.get('medications', 'None reported')}
-- Medical History: {patient_info.get('medical_history', 'None reported')}
+        # --- 3. Construct Context for Groq ---
+        context_text = f"""Patient Context:
+- Allergies: {patient_info.get('allergies', 'None')}
+- Medications: {patient_info.get('medications', 'None')}
+- History: {patient_info.get('medical_history', 'None')}
 """
-        
         if reports:
-            context_text += "\nRecent Medical Reports Summary:\n"
-            for report in reports:
-                if report['clinical_bert_analysis']:
-                    context_text += f"- {report['clinical_bert_analysis'][:200]}...\n"
+            context_text += "\nRecent Reports Analysis:\n"
+            for r in reports:
+                if r['clinical_bert_analysis']:
+                    context_text += f"- {r['clinical_bert_analysis']}\n"
         
         if clinical_bert_analysis:
-            context_text += f"\nClinical BERT Analysis of Current Query: {clinical_bert_analysis}\n"
+            context_text += f"\nBERT Entities in Current Query: {clinical_bert_analysis}\n"
         
-        # Use Groq LLM with Clinical BERT context and conversation history
+        # --- 4. Groq LLM Execution ---
         client = get_groq_client()
         system_prompt = """You are an AI medical assistant for the Neura-X platform.
 
@@ -2350,37 +2233,25 @@ IMPORTANT REMINDERS
 * This is preliminary guidance only.
 * Not a substitute for licensed medical care."""
 
-        # Build messages array with conversation history
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = [{"role": "system", "content": system_prompt}] 
         
-        # Add conversation history
-        for msg in conversation_history[-10:]:  # Keep last 10 messages for context
+        # Append history
+        for msg in conversation_history[-10:]:
             if msg.get('role') and msg.get('content'):
                 messages.append({"role": msg['role'], "content": msg['content']})
         
-        # Add current patient message with context
-        user_prompt = f"""
-Patient message: {message}
-
-Relevant patient context:
-{context_text}
-
-Follow the system instructions strictly.
-"""
-        
-        messages.append({"role": "user", "content": user_prompt})
+        # Append current message
+        messages.append({"role": "user", "content": f"Message: {message}\nContext: {context_text}"})
         
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
             temperature=0.3,
-            max_tokens=1200
+            max_tokens=1000
         )
         
         bot_response = response.choices[0].message.content
-        
-        # Check if response contains a question (ends with ? or contains question words)
-        has_question = '?' in bot_response or any(word in bot_response.lower() for word in ['can you', 'could you', 'would you', 'what', 'when', 'where', 'how', 'why', 'tell me', 'describe'])
+        has_question = '?' in bot_response # Simple check for follow-up
         
         return jsonify({
             'success': True,
@@ -2390,7 +2261,7 @@ Follow the system instructions strictly.
         })
     
     except Exception as e:
-        print(f"Chatbot error for patient {patient_id}: {str(e)}")
+        print(f"Chatbot error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/reports/<specialist_type>')
